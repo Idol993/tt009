@@ -6,62 +6,56 @@ from fourier_analyzer import FourierModeAnalyzer
 
 class InverseErrorPropagationSolver:
     def __init__(self, fourier_analyzer: FourierModeAnalyzer,
-                 max_iter: int = 50,
-                 convergence_tol: float = 1e-6,
-                 damping: float = 0.1,
-                 regularization: float = 1e-4):
+                 max_iter: int = 30,
+                 convergence_tol: float = 1e-5,
+                 damping: float = 0.3,
+                 regularization: float = 1e-4,
+                 lr: float = 0.05):
         self.fourier_analyzer = fourier_analyzer
         self.max_iter = max_iter
         self.convergence_tol = convergence_tol
         self.damping = damping
         self.regularization = regularization
+        self.lr = lr
     
-    def _forward_propagate_error(self, initial_error: torch.Tensor,
-                                 module_chain: List[Tuple[ErrorFeatureMatrix, ModuleType]]) -> torch.Tensor:
-        current_error = initial_error.clone()
+    def forward_propagate(self, initial_signal: torch.Tensor,
+                          module_chain: List[Tuple[ErrorFeatureMatrix, ModuleType]]) -> torch.Tensor:
+        current = initial_signal.clone()
+        dim = current.size(-1)
+        device = current.device
         
-        for efm, next_type in module_chain:
-            if efm.error_spectrum is None:
-                continue
-            
-            dim = current_error.size(-1)
-            device = current_error.device
-            
-            error_fft = torch.fft.rfft(current_error, dim=-1)
-            
+        for _, next_type in module_chain:
             modes = torch.fft.rfftfreq(dim, device=device)
             gain_fn = self.fourier_analyzer._module_gain_profiles.get(
                 next_type, self.fourier_analyzer._default_gain_profile
             )
             gains = gain_fn(modes)
             
-            amplified_fft = error_fft * gains.unsqueeze(0)
-            current_error = torch.fft.irfft(amplified_fft, n=dim, dim=-1)
+            signal_fft = torch.fft.rfft(current, dim=-1)
+            amplified_fft = signal_fft * gains.unsqueeze(0)
+            current = torch.fft.irfft(amplified_fft, n=dim, dim=-1)
             
             if next_type in [ModuleType.GELU, ModuleType.SOFTMAX, ModuleType.ATTENTION]:
-                nonlinear_factor = 1.0 + 0.5 * current_error.abs()
-                current_error = current_error * nonlinear_factor
+                current = current * (1.0 + 0.3 * current.abs())
         
-        return current_error
+        return current
     
-    def _compute_adjoint_gradient(self, target_error: torch.Tensor,
-                                   cancelation_signal: torch.Tensor,
-                                   module_chain: List[Tuple[ErrorFeatureMatrix, ModuleType]]) -> torch.Tensor:
-        propagated = self._forward_propagate_error(cancelation_signal, module_chain)
-        
-        residual = propagated + target_error
-        loss = 0.5 * (residual ** 2).sum()
-        
-        grad_output = residual
+    def _back_propagate_gradient(self, grad_output: torch.Tensor,
+                                  module_chain: List[Tuple[ErrorFeatureMatrix, ModuleType]],
+                                  current_signal: Optional[torch.Tensor] = None) -> torch.Tensor:
+        grad = grad_output.clone()
+        dim = grad.size(-1)
+        device = grad.device
         
         for i in range(len(module_chain) - 1, -1, -1):
-            efm, next_type = module_chain[i]
+            _, next_type = module_chain[i]
             
-            if efm.error_spectrum is None:
-                continue
-            
-            dim = grad_output.size(-1)
-            device = grad_output.device
+            if next_type in [ModuleType.GELU, ModuleType.SOFTMAX, ModuleType.ATTENTION]:
+                if current_signal is not None:
+                    propagated_i = self._propagate_partial(current_signal, module_chain[:i+1])
+                    grad = grad * (1.0 + 0.6 * propagated_i.abs())
+                else:
+                    grad = grad * 1.1
             
             modes = torch.fft.rfftfreq(dim, device=device)
             gain_fn = self.fourier_analyzer._module_gain_profiles.get(
@@ -69,86 +63,22 @@ class InverseErrorPropagationSolver:
             )
             gains = gain_fn(modes)
             
-            if next_type in [ModuleType.GELU, ModuleType.SOFTMAX, ModuleType.ATTENTION]:
-                prev_signal = self._forward_propagate_error(cancelation_signal, module_chain[:i])
-                nonlinear_grad = 0.5 * torch.sign(prev_signal)
-                grad_output = grad_output * (1.0 + nonlinear_grad.abs())
-            
-            grad_fft = torch.fft.rfft(grad_output, dim=-1)
+            grad_fft = torch.fft.rfft(grad, dim=-1)
             grad_fft = grad_fft * gains.unsqueeze(0)
-            grad_output = torch.fft.irfft(grad_fft, n=dim, dim=-1)
+            grad = torch.fft.irfft(grad_fft, n=dim, dim=-1)
         
-        return grad_output
+        return grad
     
-    def solve_cancelation_signal(self,
-                                  current_efm: ErrorFeatureMatrix,
-                                  subsequent_modules: List[Tuple[ErrorFeatureMatrix, ModuleType]],
-                                  observed_error: Optional[torch.Tensor] = None,
-                                  output_shape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
-        device = current_efm.error_mean.device
-        
-        if observed_error is not None:
-            target_error = observed_error
-        else:
-            target_error = self._synthesize_target_error(current_efm)
-        
-        if output_shape is None:
-            output_shape = target_error.shape
-        
-        cancelation = torch.zeros(output_shape, device=device)
-        momentum = torch.zeros_like(cancelation)
-        
-        best_cancelation = cancelation.clone()
-        best_residual = float('inf')
-        
-        for iteration in range(self.max_iter):
-            grad = self._compute_adjoint_gradient(target_error, cancelation, subsequent_modules)
-            
-            grad_norm = grad.norm() + self.regularization
-            normalized_grad = grad / grad_norm
-            
-            momentum = self.damping * momentum + (1 - self.damping) * normalized_grad
-            step_size = 0.1 / (1.0 + iteration * 0.05)
-            
-            cancelation = cancelation - step_size * momentum
-            
-            propagated = self._forward_propagate_error(cancelation, subsequent_modules)
-            residual = (propagated + target_error).norm().item()
-            
-            if residual < best_residual:
-                best_residual = residual
-                best_cancelation = cancelation.clone()
-            
-            if iteration > 5 and abs(best_residual - residual) < self.convergence_tol:
-                break
-        
-        return -best_cancelation.detach()
-    
-    def _synthesize_target_error(self, efm: ErrorFeatureMatrix) -> torch.Tensor:
-        device = efm.error_mean.device
-        dim = efm.error_mean.size(-1)
-        
-        base_shape = list(efm.output_shape)
-        if len(base_shape) < 2:
-            base_shape = [1] + base_shape
-        
-        error = torch.randn(base_shape, device=device) * 0.01
-        
-        if efm.error_spectrum is not None:
-            error_fft = torch.fft.rfft(error, dim=-1)
-            spectral_weights = torch.sqrt(efm.error_spectrum + 1e-10)
-            spectral_weights = spectral_weights / (spectral_weights.sum() + 1e-10)
-            error_fft = error_fft * spectral_weights.unsqueeze(0)
-            error = torch.fft.irfft(error_fft, n=dim, dim=-1)
-        
-        error = error + efm.error_mean.unsqueeze(0)
-        
-        return error.detach()
+    def _propagate_partial(self, signal, module_chain):
+        if len(module_chain) == 0:
+            return signal.clone()
+        return self.forward_propagate(signal, module_chain)
     
     def solve_spectral_domain(self,
                                current_efm: ErrorFeatureMatrix,
                                subsequent_modules: List[Tuple[ErrorFeatureMatrix, ModuleType]],
-                               output_shape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+                               output_shape: Optional[Tuple[int, ...]] = None,
+                               observed_error: Optional[torch.Tensor] = None) -> torch.Tensor:
         device = current_efm.error_mean.device
         dim = current_efm.error_mean.size(-1)
         
@@ -159,7 +89,7 @@ class InverseErrorPropagationSolver:
         modes = torch.fft.rfftfreq(dim, device=device)
         
         cumulative_gain = torch.ones(n_modes, device=device)
-        for efm, next_type in subsequent_modules:
+        for _, next_type in subsequent_modules:
             gain_fn = self.fourier_analyzer._module_gain_profiles.get(
                 next_type, self.fourier_analyzer._default_gain_profile
             )
@@ -168,35 +98,166 @@ class InverseErrorPropagationSolver:
         
         cumulative_gain = torch.clamp(cumulative_gain, min=0.01, max=100.0)
         
-        if current_efm.error_spectrum is not None and current_efm.error_spectrum.sum() > 1e-20:
-            target_spectrum = current_efm.error_spectrum
+        if observed_error is not None and observed_error.abs().sum() > 1e-20:
+            flat_error = observed_error.detach().view(-1, dim)
+            avg_error_fft = torch.fft.rfft(flat_error.mean(dim=0), n=dim)
+            
+            target_magnitude = avg_error_fft.abs()
+            target_phase = torch.angle(avg_error_fft)
+            
+            cancelation_magnitude = target_magnitude / (cumulative_gain + self.regularization)
+            cancelation_phase = target_phase + 3.141592653589793
+            
+            cancelation_fft_1d = cancelation_magnitude * torch.exp(1j * cancelation_phase)
+            
+            batch_dims = output_shape[:-1]
+            cancelation_fft = cancelation_fft_1d.unsqueeze(0).expand(*batch_dims, -1).clone()
+            cancelation_signal = torch.fft.irfft(cancelation_fft, n=dim, dim=-1)
+            
         else:
-            target_spectrum = torch.ones(n_modes, device=device) * 1e-6
-        
-        target_spectrum = torch.nan_to_num(target_spectrum, nan=1e-6, posinf=1e-6, neginf=1e-6)
-        
-        cancelation_magnitude = target_spectrum / (cumulative_gain + self.regularization)
-        cancelation_magnitude = torch.clamp(cancelation_magnitude, max=1e6)
-        
-        cancelation_phase = torch.zeros(n_modes, dtype=torch.float32, device=device)
-        if current_efm.error_mean.abs().sum() > 1e-20:
-            mean_fft = torch.fft.rfft(current_efm.error_mean)
-            cancelation_phase = torch.angle(mean_fft) + 3.141592653589793
-        
-        cancelation_spectrum = cancelation_magnitude * torch.exp(1j * cancelation_phase)
-        cancelation_spectrum = torch.nan_to_num(cancelation_spectrum, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        batch_dims = output_shape[:-1]
-        cancelation_fft = cancelation_spectrum.unsqueeze(0).expand(*batch_dims, -1).clone()
-        cancelation_signal = torch.fft.irfft(cancelation_fft, n=dim, dim=-1)
+            if current_efm.error_spectrum is not None and current_efm.error_spectrum.sum() > 1e-20:
+                target_power = current_efm.error_spectrum
+            else:
+                return torch.zeros(output_shape, device=device)
+            
+            cancelation_magnitude = torch.sqrt(target_power + 1e-20) / (cumulative_gain + self.regularization)
+            cancelation_magnitude = torch.clamp(cancelation_magnitude, max=1e6)
+            
+            has_bias = current_efm.error_mean.abs().sum() > 1e-10
+            if has_bias:
+                mean_fft = torch.fft.rfft(current_efm.error_mean, n=dim)
+                base_phase = torch.angle(mean_fft) + 3.141592653589793
+            else:
+                return torch.zeros(output_shape, device=device)
+            
+            cancelation_fft_1d = cancelation_magnitude * torch.exp(1j * base_phase)
+            
+            batch_dims = output_shape[:-1]
+            cancelation_fft = cancelation_fft_1d.unsqueeze(0).expand(*batch_dims, -1).clone()
+            cancelation_signal = torch.fft.irfft(cancelation_fft, n=dim, dim=-1)
         
         cancelation_signal = torch.nan_to_num(cancelation_signal, nan=0.0, posinf=0.0, neginf=0.0)
         
-        target_energy = target_spectrum.sum().clamp(min=1e-20)
-        cancel_energy = cancelation_signal.pow(2).mean().clamp(min=1e-20)
-        scale_factor = torch.sqrt(target_energy / cancel_energy) * 0.3
-        scale_factor = torch.clamp(scale_factor, max=1e3)
-        
-        cancelation_signal = cancelation_signal * scale_factor
-        
         return cancelation_signal.detach()
+    
+    def solve_cancelation_signal(self,
+                                  current_efm: ErrorFeatureMatrix,
+                                  subsequent_modules: List[Tuple[ErrorFeatureMatrix, ModuleType]],
+                                  observed_error: Optional[torch.Tensor] = None,
+                                  output_shape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+        device = current_efm.error_mean.device
+        
+        if observed_error is not None and observed_error.numel() > 0:
+            flat_err = observed_error.detach().view(-1, observed_error.size(-1))
+            target_error = flat_err.mean(dim=0).unsqueeze(0)
+        else:
+            target_error = self._synthesize_target_error(current_efm)
+        
+        if output_shape is None:
+            output_shape = target_error.shape
+        
+        cancelation = self.solve_spectral_domain(
+            current_efm, subsequent_modules,
+            output_shape=(1, target_error.size(-1)),
+            observed_error=target_error
+        )
+        
+        best_residual = self._compute_residual(cancelation, target_error, subsequent_modules)
+        best_cancelation = cancelation.clone()
+        
+        has_nonlinear = any(
+            mt in [ModuleType.GELU, ModuleType.SOFTMAX, ModuleType.ATTENTION]
+            for _, mt in subsequent_modules
+        )
+        
+        if not has_nonlinear and len(subsequent_modules) <= 2:
+            batch_dims = output_shape[:-1]
+            final_cancelation = best_cancelation.expand(*batch_dims, -1).clone()
+            return final_cancelation.detach()
+        
+        velocity = torch.zeros_like(cancelation)
+        current_lr = self.lr
+        
+        for iteration in range(self.max_iter):
+            propagated = self.forward_propagate(cancelation, subsequent_modules)
+            residual = propagated + target_error
+            
+            grad = residual.clone()
+            grad = self._back_propagate_gradient(grad, subsequent_modules, cancelation)
+            
+            grad_norm = grad.norm()
+            if grad_norm < self.regularization:
+                break
+            
+            velocity = self.damping * velocity + (1.0 - self.damping) * grad
+            step_size = current_lr / (1.0 + iteration * 0.01)
+            
+            new_cancelation = cancelation - step_size * velocity
+            
+            current_residual = self._compute_residual(new_cancelation, target_error, subsequent_modules)
+            
+            if current_residual < best_residual:
+                best_residual = current_residual
+                best_cancelation = new_cancelation.clone()
+                cancelation = new_cancelation
+            else:
+                current_lr *= 0.5
+                if current_lr < 1e-6:
+                    break
+                cancelation = best_cancelation.clone()
+                velocity.zero_()
+            
+            if iteration > 5 and best_residual < self.convergence_tol:
+                break
+        
+        batch_dims = output_shape[:-1]
+        final_cancelation = best_cancelation.expand(*batch_dims, -1).clone()
+        
+        return final_cancelation.detach()
+    
+    def _compute_residual(self, cancelation, target_error, module_chain) -> float:
+        propagated = self.forward_propagate(cancelation, module_chain)
+        return (propagated + target_error).norm().item()
+    
+    def _synthesize_target_error(self, efm: ErrorFeatureMatrix) -> torch.Tensor:
+        device = efm.error_mean.device
+        dim = efm.error_mean.size(-1)
+        
+        error = torch.zeros((1, dim), device=device)
+        
+        if efm.error_spectrum is not None and efm.error_spectrum.sum() > 1e-20:
+            noise = torch.randn((1, dim), device=device)
+            noise_fft = torch.fft.rfft(noise, n=dim)
+            power_weights = torch.sqrt(efm.error_spectrum + 1e-20)
+            noise_fft = noise_fft * power_weights.unsqueeze(0)
+            error = torch.fft.irfft(noise_fft, n=dim, dim=-1)
+        
+        error = error + efm.error_mean.unsqueeze(0)
+        
+        return error.detach()
+    
+    def verify_cancellation(self,
+                             initial_error: torch.Tensor,
+                             cancelation_signal: torch.Tensor,
+                             module_chain: List[Tuple[ErrorFeatureMatrix, ModuleType]]) -> dict:
+        with torch.no_grad():
+            propagated_error = self.forward_propagate(initial_error, module_chain)
+            propagated_cancel = self.forward_propagate(cancelation_signal, module_chain)
+            combined = propagated_error + propagated_cancel
+            
+            error_norm = propagated_error.norm().item()
+            combined_norm = combined.norm().item()
+            reduction_ratio = (1.0 - combined_norm / max(error_norm, 1e-20))
+            
+            dot_product = (propagated_error * propagated_cancel).sum().item()
+            cos_similarity = dot_product / max(error_norm * propagated_cancel.norm().item(), 1e-20)
+        
+        return {
+            "error_norm": error_norm,
+            "cancel_norm_after_prop": propagated_cancel.norm().item(),
+            "combined_norm": combined_norm,
+            "reduction_ratio": reduction_ratio,
+            "cos_similarity": cos_similarity,
+            "is_opposite_phase": cos_similarity < -0.1,
+            "is_improved": reduction_ratio > 0.0,
+        }

@@ -1,63 +1,130 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from typing import Optional, Callable
 from error_features import ModuleErrorTracker, ModuleType
 from error_canceler import ErrorCancellationInjector
+from low_precision_sim import LowPrecisionSimulator
 
 
 class BudgetController:
     def __init__(self, max_overhead_ratio: float = 0.05,
-                 initial_skip: int = 20):
+                 window_size: int = 10,
+                 initial_skip: int = 9):
         self.max_overhead_ratio = max_overhead_ratio
+        self.window_size = window_size
         
-        self._call_counter: int = 0
-        self._compensation_run_count: int = 0
-        self._total_calls: int = 0
+        self._baseline_forward_times: list = []
+        self._active_forward_times: list = []
+        self._active_overhead_times: list = []
         
-        self._current_skip: int = initial_skip
         self._enabled: bool = True
+        self._forward_counter: int = 0
+        self._skip_counter: int = 0
+        self._current_skip: int = initial_skip
+        self._warmup_remaining: int = 5
         
-        self._actual_overhead_ratio: float = 0.0
+        self._last_overhead_ratio: float = 0.0
+        self._is_current_forward_active: bool = False
     
-    def record_forward_time(self, t: float):
-        pass
-    
-    def record_overhead_time(self, t: float):
-        pass
-    
-    def should_run_cancellation(self) -> bool:
+    def start_forward(self) -> bool:
         if not self._enabled:
+            self._is_current_forward_active = False
             return False
         
-        self._call_counter += 1
-        self._total_calls += 1
+        self._forward_counter += 1
         
-        if self._call_counter > self._current_skip:
-            self._call_counter = 0
-            self._compensation_run_count += 1
-            self._actual_overhead_ratio = self._compensation_run_count / max(self._total_calls, 1)
+        if self._warmup_remaining > 0:
+            self._warmup_remaining -= 1
+            self._is_current_forward_active = False
+            return False
+        
+        if self._skip_counter > 0:
+            self._skip_counter -= 1
+            self._is_current_forward_active = False
+        else:
+            self._is_current_forward_active = True
+        
+        return self._is_current_forward_active
+    
+    def end_forward(self, forward_time: float, overhead_time: float):
+        if not self._enabled:
+            return
+        
+        if self._is_current_forward_active:
+            self._active_forward_times.append(forward_time)
+            self._active_overhead_times.append(overhead_time)
             
-            if self._actual_overhead_ratio > self.max_overhead_ratio * 1.2:
-                self._current_skip = min(self._current_skip + 2, 100)
-            elif self._actual_overhead_ratio < self.max_overhead_ratio * 0.5:
-                self._current_skip = max(2, self._current_skip - 1)
+            if len(self._active_forward_times) > self.window_size:
+                self._active_forward_times.pop(0)
+                self._active_overhead_times.pop(0)
+        else:
+            self._baseline_forward_times.append(forward_time)
+            if len(self._baseline_forward_times) > self.window_size:
+                self._baseline_forward_times.pop(0)
+        
+        if len(self._baseline_forward_times) >= 2 and len(self._active_forward_times) >= 1:
+            avg_baseline = sum(self._baseline_forward_times) / len(self._baseline_forward_times)
+            avg_active = sum(self._active_forward_times) / len(self._active_forward_times)
             
-            return True
-        return False
+            if avg_baseline > 0:
+                single_overhead_ratio = (avg_active - avg_baseline) / avg_baseline
+                
+                active_frequency = 1.0 / (self._current_skip + 1)
+                self._last_overhead_ratio = single_overhead_ratio * active_frequency
+                
+                target_skip = max(1, int(single_overhead_ratio / self.max_overhead_ratio * 1.2) - 1)
+                
+                if self._current_skip < target_skip:
+                    self._current_skip = min(self._current_skip * 2, target_skip + 20)
+                elif self._current_skip > target_skip * 3:
+                    self._current_skip = max(1, self._current_skip - 2)
+                
+                self._skip_counter = self._current_skip
+    
+    def should_run_cancellation(self) -> bool:
+        return self._is_current_forward_active and self._enabled
     
     def get_current_overhead_ratio(self) -> float:
-        if self._total_calls == 0:
-            return 0.0
-        return self._compensation_run_count / self._total_calls
+        return min(self._last_overhead_ratio, 1.0)
     
     def reset(self):
-        self._call_counter = 0
-        self._compensation_run_count = 0
-        self._total_calls = 0
+        self._baseline_forward_times = []
+        self._active_forward_times = []
+        self._active_overhead_times = []
+        self._forward_counter = 0
+        self._skip_counter = 0
+        self._current_skip = 19
+        self._last_overhead_ratio = 0.0
+        self._is_current_forward_active = False
     
     def set_enabled(self, enabled: bool):
         self._enabled = enabled
+
+
+class _TimingHelper:
+    def __init__(self, budget_controller: BudgetController):
+        self.bc = budget_controller
+        self._fwd_start: float = 0.0
+        self._oh_accum: float = 0.0
+        self._oh_start: float = 0.0
+        self._is_active: bool = False
+    
+    def start_forward(self):
+        self._is_active = self.bc.start_forward()
+        self._fwd_start = time.perf_counter()
+        self._oh_accum = 0.0
+    
+    def start_overhead_segment(self):
+        self._oh_start = time.perf_counter()
+    
+    def end_overhead_segment(self):
+        self._oh_accum += time.perf_counter() - self._oh_start
+    
+    def end_forward(self):
+        total_fwd = time.perf_counter() - self._fwd_start
+        self.bc.end_forward(total_fwd, self._oh_accum)
 
 
 class ErrorCompensatedLinear(nn.Module):
@@ -66,19 +133,18 @@ class ErrorCompensatedLinear(nn.Module):
                  tracker: ModuleErrorTracker,
                  canceler: ErrorCancellationInjector,
                  budget_controller: BudgetController,
-                 enable_reference_fp32: bool = True,
-                 reference_interval: int = 10):
+                 precision_sim: LowPrecisionSimulator,
+                 timing_helper: _TimingHelper):
         super().__init__()
         self.linear = linear
         self.name = name
         self.tracker = tracker
         self.canceler = canceler
         self.budget_controller = budget_controller
-        self.enable_reference_fp32 = enable_reference_fp32
-        self.reference_interval = reference_interval
+        self.precision_sim = precision_sim
+        self.timing_helper = timing_helper
         
         self._is_registered = False
-        self._call_count = 0
     
     def _register(self, input_shape):
         output_features = self.linear.out_features
@@ -93,28 +159,37 @@ class ErrorCompensatedLinear(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        self._call_count += 1
-        
         if not self.budget_controller.should_run_cancellation():
             return self.linear(x)
         
-        output_low = self.linear(x)
+        self.timing_helper.start_overhead_segment()
         
-        output_high = None
-        should_compute_ref = (
-            self.enable_reference_fp32 and self.training
-            and self._call_count % self.reference_interval == 0
-        )
-        if should_compute_ref:
-            with torch.no_grad():
-                weight_fp32 = self.linear.weight.float()
-                bias_fp32 = self.linear.bias.float() if self.linear.bias is not None else None
-                input_fp32 = x.float()
-                output_high = F.linear(input_fp32, weight_fp32, bias_fp32)
+        use_native = self.precision_sim.is_native_low_precision()
+        
+        if use_native:
+            dtype = self.precision_sim.get_dtype()
+            x_low = x.to(dtype)
+            w_low = self.linear.weight.to(dtype)
+            b_low = self.linear.bias.to(dtype) if self.linear.bias is not None else None
+            output_low = F.linear(x_low, w_low, b_low).float()
+        else:
+            output_fp32 = F.linear(x.float(), self.linear.weight.float(),
+                                     self.linear.bias.float() if self.linear.bias is not None else None)
+            output_low = self.precision_sim.quantize(output_fp32)
+        
+        with torch.no_grad():
+            output_high = F.linear(
+                x.float(),
+                self.linear.weight.float(),
+                self.linear.bias.float() if self.linear.bias is not None else None
+            )
+            observed_error = output_low - output_high
         
         output_compensated = self.canceler.compute_and_inject(
             self.name, output_low, output_high
         )
+        
+        self.timing_helper.end_overhead_segment()
         
         return output_compensated
 
@@ -125,19 +200,18 @@ class ErrorCompensatedLayerNorm(nn.Module):
                  tracker: ModuleErrorTracker,
                  canceler: ErrorCancellationInjector,
                  budget_controller: BudgetController,
-                 enable_reference_fp32: bool = True,
-                 reference_interval: int = 10):
+                 precision_sim: LowPrecisionSimulator,
+                 timing_helper: _TimingHelper):
         super().__init__()
         self.norm = norm
         self.name = name
         self.tracker = tracker
         self.canceler = canceler
         self.budget_controller = budget_controller
-        self.enable_reference_fp32 = enable_reference_fp32
-        self.reference_interval = reference_interval
+        self.precision_sim = precision_sim
+        self.timing_helper = timing_helper
         
         self._is_registered = False
-        self._call_count = 0
     
     def _register(self, input_shape):
         self.tracker.register_module(
@@ -150,30 +224,43 @@ class ErrorCompensatedLayerNorm(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        self._call_count += 1
-        
         if not self.budget_controller.should_run_cancellation():
             return self.norm(x)
         
-        output_low = self.norm(x)
+        self.timing_helper.start_overhead_segment()
         
-        output_high = None
-        should_compute_ref = (
-            self.enable_reference_fp32 and self.training
-            and self._call_count % self.reference_interval == 0
-        )
-        if should_compute_ref:
-            with torch.no_grad():
-                output_high = F.layer_norm(
-                    x.float(), self.norm.normalized_shape,
-                    self.norm.weight.float() if self.norm.weight is not None else None,
-                    self.norm.bias.float() if self.norm.bias is not None else None,
-                    self.norm.eps
-                )
+        use_native = self.precision_sim.is_native_low_precision()
+        
+        if use_native:
+            dtype = self.precision_sim.get_dtype()
+            x_low = x.to(dtype)
+            w_low = self.norm.weight.to(dtype) if self.norm.weight is not None else None
+            b_low = self.norm.bias.to(dtype) if self.norm.bias is not None else None
+            output_low = F.layer_norm(
+                x_low, self.norm.normalized_shape, w_low, b_low, self.norm.eps
+            ).float()
+        else:
+            output_fp32 = F.layer_norm(
+                x.float(), self.norm.normalized_shape,
+                self.norm.weight.float() if self.norm.weight is not None else None,
+                self.norm.bias.float() if self.norm.bias is not None else None,
+                self.norm.eps
+            )
+            output_low = self.precision_sim.quantize(output_fp32)
+        
+        with torch.no_grad():
+            output_high = F.layer_norm(
+                x.float(), self.norm.normalized_shape,
+                self.norm.weight.float() if self.norm.weight is not None else None,
+                self.norm.bias.float() if self.norm.bias is not None else None,
+                self.norm.eps
+            )
         
         output_compensated = self.canceler.compute_and_inject(
             self.name, output_low, output_high
         )
+        
+        self.timing_helper.end_overhead_segment()
         
         return output_compensated
 
@@ -183,18 +270,19 @@ class ErrorCompensatedGELU(nn.Module):
                  tracker: ModuleErrorTracker,
                  canceler: ErrorCancellationInjector,
                  budget_controller: BudgetController,
-                 approximate: str = 'none',
-                 reference_interval: int = 10):
+                 precision_sim: LowPrecisionSimulator,
+                 timing_helper: _TimingHelper,
+                 approximate: str = 'none'):
         super().__init__()
         self.name = name
         self.tracker = tracker
         self.canceler = canceler
         self.budget_controller = budget_controller
+        self.precision_sim = precision_sim
+        self.timing_helper = timing_helper
         self.approximate = approximate
-        self.reference_interval = reference_interval
         
         self._is_registered = False
-        self._call_count = 0
     
     def _register(self, input_shape):
         self.tracker.register_module(
@@ -207,25 +295,28 @@ class ErrorCompensatedGELU(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        self._call_count += 1
-        
         if not self.budget_controller.should_run_cancellation():
             return F.gelu(x, approximate=self.approximate)
         
-        output_low = F.gelu(x, approximate=self.approximate)
+        self.timing_helper.start_overhead_segment()
         
-        output_high = None
-        should_compute_ref = (
-            self.training
-            and self._call_count % self.reference_interval == 0
-        )
-        if should_compute_ref:
-            with torch.no_grad():
-                output_high = F.gelu(x.float(), approximate='none')
+        use_native = self.precision_sim.is_native_low_precision()
+        
+        if use_native:
+            dtype = self.precision_sim.get_dtype()
+            output_low = F.gelu(x.to(dtype), approximate=self.approximate).float()
+        else:
+            output_fp32 = F.gelu(x.float(), approximate='none')
+            output_low = self.precision_sim.quantize(output_fp32)
+        
+        with torch.no_grad():
+            output_high = F.gelu(x.float(), approximate='none')
         
         output_compensated = self.canceler.compute_and_inject(
             self.name, output_low, output_high
         )
+        
+        self.timing_helper.end_overhead_segment()
         
         return output_compensated
 
@@ -235,18 +326,19 @@ class ErrorCompensatedSoftmax(nn.Module):
                  tracker: ModuleErrorTracker,
                  canceler: ErrorCancellationInjector,
                  budget_controller: BudgetController,
-                 dim: int = -1,
-                 reference_interval: int = 10):
+                 precision_sim: LowPrecisionSimulator,
+                 timing_helper: _TimingHelper,
+                 dim: int = -1):
         super().__init__()
         self.name = name
         self.tracker = tracker
         self.canceler = canceler
         self.budget_controller = budget_controller
+        self.precision_sim = precision_sim
+        self.timing_helper = timing_helper
         self.dim = dim
-        self.reference_interval = reference_interval
         
         self._is_registered = False
-        self._call_count = 0
     
     def _register(self, input_shape):
         self.tracker.register_module(
@@ -259,25 +351,28 @@ class ErrorCompensatedSoftmax(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        self._call_count += 1
-        
         if not self.budget_controller.should_run_cancellation():
             return F.softmax(x, dim=self.dim)
         
-        output_low = F.softmax(x, dim=self.dim)
+        self.timing_helper.start_overhead_segment()
         
-        output_high = None
-        should_compute_ref = (
-            self.training
-            and self._call_count % self.reference_interval == 0
-        )
-        if should_compute_ref:
-            with torch.no_grad():
-                output_high = F.softmax(x.float(), dim=self.dim)
+        use_native = self.precision_sim.is_native_low_precision()
+        
+        if use_native:
+            dtype = self.precision_sim.get_dtype()
+            output_low = F.softmax(x.to(dtype), dim=self.dim).float()
+        else:
+            output_fp32 = F.softmax(x.float(), dim=self.dim)
+            output_low = self.precision_sim.quantize(output_fp32)
+        
+        with torch.no_grad():
+            output_high = F.softmax(x.float(), dim=self.dim)
         
         output_compensated = self.canceler.compute_and_inject(
             self.name, output_low, output_high
         )
+        
+        self.timing_helper.end_overhead_segment()
         
         return output_compensated
 
@@ -287,15 +382,29 @@ def wrap_module(module: nn.Module,
                 tracker: ModuleErrorTracker,
                 canceler: ErrorCancellationInjector,
                 budget_controller: BudgetController,
+                precision_sim: LowPrecisionSimulator,
+                timing_helper: _TimingHelper,
                 **kwargs) -> nn.Module:
     if isinstance(module, nn.Linear):
-        return ErrorCompensatedLinear(module, name, tracker, canceler, budget_controller, **kwargs)
+        return ErrorCompensatedLinear(
+            module, name, tracker, canceler, budget_controller,
+            precision_sim, timing_helper, **kwargs
+        )
     elif isinstance(module, nn.LayerNorm):
-        return ErrorCompensatedLayerNorm(module, name, tracker, canceler, budget_controller, **kwargs)
+        return ErrorCompensatedLayerNorm(
+            module, name, tracker, canceler, budget_controller,
+            precision_sim, timing_helper, **kwargs
+        )
     elif isinstance(module, nn.GELU):
-        return ErrorCompensatedGELU(name, tracker, canceler, budget_controller, **kwargs)
+        return ErrorCompensatedGELU(
+            name, tracker, canceler, budget_controller,
+            precision_sim, timing_helper, approximate=kwargs.get('approximate', 'none'), **kwargs
+        )
     elif isinstance(module, nn.Softmax):
-        return ErrorCompensatedSoftmax(name, tracker, canceler, budget_controller, dim=module.dim, **kwargs)
+        return ErrorCompensatedSoftmax(
+            name, tracker, canceler, budget_controller,
+            precision_sim, timing_helper, dim=module.dim, **kwargs
+        )
     else:
         return module
 
@@ -304,13 +413,19 @@ def wrap_model(model: nn.Module,
                tracker: ModuleErrorTracker,
                canceler: ErrorCancellationInjector,
                budget_controller: BudgetController,
+               precision_sim: LowPrecisionSimulator,
+               timing_helper: _TimingHelper,
                prefix: str = "") -> nn.Module:
     for name, child in list(model.named_children()):
         full_name = f"{prefix}.{name}" if prefix else name
         
         if isinstance(child, (nn.Linear, nn.LayerNorm, nn.GELU, nn.Softmax)):
-            setattr(model, name, wrap_module(child, full_name, tracker, canceler, budget_controller))
+            setattr(model, name, wrap_module(
+                child, full_name, tracker, canceler,
+                budget_controller, precision_sim, timing_helper
+            ))
         else:
-            wrap_model(child, tracker, canceler, budget_controller, full_name)
+            wrap_model(child, tracker, canceler, budget_controller,
+                       precision_sim, timing_helper, full_name)
     
     return model

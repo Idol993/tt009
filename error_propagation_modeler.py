@@ -8,16 +8,23 @@ from error_features import ModuleErrorTracker
 from fourier_analyzer import FourierModeAnalyzer
 from inverse_solver import InverseErrorPropagationSolver
 from error_canceler import ErrorCancellationInjector
-from module_wrappers import BudgetController, wrap_model
+from module_wrappers import (
+    BudgetController, _TimingHelper, wrap_model
+)
+from low_precision_sim import LowPrecisionSimulator
 
 
 class ErrorPropagationModeler:
     def __init__(self,
+                 precision: str = "fp16",
                  max_overhead_ratio: float = 0.05,
                  n_fourier_modes: int = 64,
                  max_cancellation_strength: float = 0.3,
                  solver_max_iter: int = 30,
                  use_fast_path: bool = True):
+        self.precision = precision.lower()
+        self.precision_sim = LowPrecisionSimulator(precision)
+        
         self.tracker = ModuleErrorTracker()
         self.fourier_analyzer = FourierModeAnalyzer(n_modes=n_fourier_modes)
         self.inverse_solver = InverseErrorPropagationSolver(
@@ -34,12 +41,10 @@ class ErrorPropagationModeler:
         self.budget_controller = BudgetController(
             max_overhead_ratio=max_overhead_ratio
         )
+        self.timing_helper = _TimingHelper(self.budget_controller)
         
         self._is_wrapped = False
         self._model: Optional[nn.Module] = None
-        
-        self._forward_start: float = 0.0
-        self._overhead_accumulator: float = 0.0
     
     def wrap_model(self, model: nn.Module) -> nn.Module:
         if self._is_wrapped:
@@ -48,7 +53,11 @@ class ErrorPropagationModeler:
         device = next(model.parameters()).device
         self.tracker.set_device(device)
         
-        wrapped = wrap_model(model, self.tracker, self.canceler, self.budget_controller)
+        wrapped = wrap_model(
+            model, self.tracker, self.canceler,
+            self.budget_controller, self.precision_sim,
+            self.timing_helper
+        )
         self._model = wrapped
         self._is_wrapped = True
         
@@ -56,26 +65,19 @@ class ErrorPropagationModeler:
     
     @contextmanager
     def track_forward(self):
-        self._overhead_accumulator = 0.0
-        self._forward_start = time.perf_counter()
-        overhead_start = time.perf_counter()
-        
+        self.timing_helper.start_forward()
         try:
             yield
-            self._overhead_accumulator += time.perf_counter() - overhead_start
         finally:
-            total_forward = time.perf_counter() - self._forward_start
-            self.budget_controller.record_forward_time(total_forward)
-            self.budget_controller.record_overhead_time(self._overhead_accumulator)
-    
-    def record_overhead_segment(self, duration: float):
-        self._overhead_accumulator += duration
+            self.timing_helper.end_forward()
     
     def get_overhead_ratio(self) -> float:
         return self.budget_controller.get_current_overhead_ratio()
     
     def get_cancellation_stats(self) -> Dict[str, Any]:
         return {
+            "precision": self.precision,
+            "precision_label": self.precision_sim.precision_label(),
             "overhead_ratio": self.get_overhead_ratio(),
             "module_stats": self.canceler.get_cancellation_stats(),
             "registered_modules": len(self.tracker.trackers),
@@ -84,17 +86,54 @@ class ErrorPropagationModeler:
     def print_stats(self):
         stats = self.get_cancellation_stats()
         print(f"=== 误差传播建模器状态 ===")
+        print(f"精度模式: {stats['precision_label']}")
         print(f"总开销比例: {stats['overhead_ratio']:.4f} ({stats['overhead_ratio']*100:.2f}%)")
         print(f"已注册模块数: {stats['registered_modules']}")
         if stats['module_stats']:
-            print("各模块抵消信号统计:")
-            for name, mstats in stats['module_stats'].items():
+            print("各模块抵消信号统计 (前5个):")
+            for i, (name, mstats) in enumerate(stats['module_stats'].items()):
+                if i >= 5:
+                    print(f"  ... 还有 {len(stats['module_stats']) - 5} 个模块")
+                    break
                 print(f"  {name}:")
                 print(f"    抵消均值={mstats['cancelation_mean']:.2e}")
                 print(f"    抵消最大={mstats['cancelation_max']:.2e}")
                 print(f"    观测误差最大={mstats['error_max_observed']:.2e}")
                 print(f"    更新次数={mstats['update_count']}")
         print("=" * 40)
+    
+    def run_cancellation_verification(self, module_name: str,
+                                       subsequent_count: int = 1) -> Optional[dict]:
+        efm = self.tracker.get_tracker(module_name)
+        if efm is None or efm.error_spectrum is None:
+            return None
+        
+        subsequent = self.canceler._get_subsequent_modules(module_name)
+        subsequent = subsequent[:subsequent_count]
+        
+        if len(subsequent) == 0:
+            return None
+        
+        dim = efm.error_mean.size(-1)
+        device = efm.error_mean.device
+        
+        test_error = torch.randn(1, dim, device=device) * 0.01
+        if efm.error_spectrum is not None:
+            noise_fft = torch.fft.rfft(test_error, n=dim)
+            weights = torch.sqrt(efm.error_spectrum + 1e-20)
+            noise_fft = noise_fft * weights.unsqueeze(0)
+            test_error = torch.fft.irfft(noise_fft, n=dim, dim=-1)
+        
+        cancelation = self.inverse_solver.solve_spectral_domain(
+            efm, subsequent, output_shape=(1, dim),
+            observed_error=test_error
+        )
+        
+        result = self.inverse_solver.verify_cancellation(
+            test_error, cancelation, subsequent
+        )
+        
+        return result
     
     def reset(self):
         self.canceler.reset()
@@ -121,4 +160,4 @@ def create_low_precision_modeler(
         kwargs.setdefault("max_cancellation_strength", 0.15)
         kwargs.setdefault("solver_max_iter", 20)
     
-    return ErrorPropagationModeler(**kwargs)
+    return ErrorPropagationModeler(precision=precision, **kwargs)

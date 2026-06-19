@@ -79,6 +79,7 @@ class ErrorCancellationInjector:
         
         self.register_execution_order(module_name)
         
+        estimated_error = None
         if output_high is not None:
             estimated_error = self._estimate_rounding_error(output_low, output_high, efm)
             self.fourier_analyzer.analyze_error_spectrum(estimated_error, efm)
@@ -96,12 +97,13 @@ class ErrorCancellationInjector:
         
         if self.use_fast_path and not force_full_solve:
             cancelation = self.inverse_solver.solve_spectral_domain(
-                efm, subsequent, output_low.shape
+                efm, subsequent, output_low.shape,
+                observed_error=estimated_error
             )
         else:
             cancelation = self.inverse_solver.solve_cancelation_signal(
                 efm, subsequent,
-                observed_error=estimated_error if output_high is not None else None,
+                observed_error=estimated_error,
                 output_shape=output_low.shape
             )
         
