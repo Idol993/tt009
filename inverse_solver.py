@@ -100,19 +100,21 @@ class InverseErrorPropagationSolver:
         
         if observed_error is not None and observed_error.abs().sum() > 1e-20:
             flat_error = observed_error.detach().view(-1, dim)
-            avg_error_fft = torch.fft.rfft(flat_error.mean(dim=0), n=dim)
             
-            target_magnitude = avg_error_fft.abs()
-            target_phase = torch.angle(avg_error_fft)
+            batch_size = flat_error.size(0)
+            error_fft_per_sample = torch.fft.rfft(flat_error, n=dim, dim=-1)
             
-            cancelation_magnitude = target_magnitude / (cumulative_gain + self.regularization)
-            cancelation_phase = target_phase + 3.141592653589793
+            target_magnitude_per_sample = error_fft_per_sample.abs()
+            target_phase_per_sample = torch.angle(error_fft_per_sample)
             
-            cancelation_fft_1d = cancelation_magnitude * torch.exp(1j * cancelation_phase)
+            cancelation_magnitude_per_sample = target_magnitude_per_sample / (cumulative_gain.unsqueeze(0) + self.regularization)
+            cancelation_phase_per_sample = target_phase_per_sample + 3.141592653589793
+            
+            cancelation_fft_per_sample = cancelation_magnitude_per_sample * torch.exp(1j * cancelation_phase_per_sample)
+            cancelation_signal_per_sample = torch.fft.irfft(cancelation_fft_per_sample, n=dim, dim=-1)
             
             batch_dims = output_shape[:-1]
-            cancelation_fft = cancelation_fft_1d.unsqueeze(0).expand(*batch_dims, -1).clone()
-            cancelation_signal = torch.fft.irfft(cancelation_fft, n=dim, dim=-1)
+            cancelation_signal = cancelation_signal_per_sample.view(*batch_dims + (dim,))
             
         else:
             if current_efm.error_spectrum is not None and current_efm.error_spectrum.sum() > 1e-20:
@@ -144,46 +146,47 @@ class InverseErrorPropagationSolver:
                                   current_efm: ErrorFeatureMatrix,
                                   subsequent_modules: List[Tuple[ErrorFeatureMatrix, ModuleType]],
                                   observed_error: Optional[torch.Tensor] = None,
-                                  output_shape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+                                  output_shape: Optional[Tuple[int, ...]] = None,
+                                  force_full_solve: bool = False) -> torch.Tensor:
         device = current_efm.error_mean.device
         
         if observed_error is not None and observed_error.numel() > 0:
-            flat_err = observed_error.detach().view(-1, observed_error.size(-1))
-            target_error = flat_err.mean(dim=0).unsqueeze(0)
+            target_error = observed_error.detach()
         else:
             target_error = self._synthesize_target_error(current_efm)
         
         if output_shape is None:
             output_shape = target_error.shape
         
-        cancelation = self.solve_spectral_domain(
-            current_efm, subsequent_modules,
-            output_shape=(1, target_error.size(-1)),
-            observed_error=target_error
-        )
-        
-        best_residual = self._compute_residual(cancelation, target_error, subsequent_modules)
-        best_cancelation = cancelation.clone()
-        
         has_nonlinear = any(
             mt in [ModuleType.GELU, ModuleType.SOFTMAX, ModuleType.ATTENTION]
             for _, mt in subsequent_modules
         )
         
-        if not has_nonlinear and len(subsequent_modules) <= 2:
-            batch_dims = output_shape[:-1]
-            final_cancelation = best_cancelation.expand(*batch_dims, -1).clone()
-            return final_cancelation.detach()
+        cancelation = self.solve_spectral_domain(
+            current_efm, subsequent_modules,
+            output_shape=output_shape,
+            observed_error=target_error
+        )
         
-        velocity = torch.zeros_like(cancelation)
+        if not has_nonlinear and not force_full_solve:
+            return cancelation.detach()
+        
+        target_flat = target_error.detach().view(-1, target_error.size(-1))
+        cancelation_flat = cancelation.detach().view(-1, cancelation.size(-1))
+        
+        best_residual = self._compute_residual(cancelation_flat, target_flat, subsequent_modules)
+        best_cancelation_flat = cancelation_flat.clone()
+        
+        velocity = torch.zeros_like(cancelation_flat)
         current_lr = self.lr
         
         for iteration in range(self.max_iter):
-            propagated = self.forward_propagate(cancelation, subsequent_modules)
-            residual = propagated + target_error
+            propagated = self.forward_propagate(cancelation_flat, subsequent_modules)
+            residual = propagated + target_flat
             
             grad = residual.clone()
-            grad = self._back_propagate_gradient(grad, subsequent_modules, cancelation)
+            grad = self._back_propagate_gradient(grad, subsequent_modules, cancelation_flat)
             
             grad_norm = grad.norm()
             if grad_norm < self.regularization:
@@ -192,26 +195,25 @@ class InverseErrorPropagationSolver:
             velocity = self.damping * velocity + (1.0 - self.damping) * grad
             step_size = current_lr / (1.0 + iteration * 0.01)
             
-            new_cancelation = cancelation - step_size * velocity
+            new_cancelation = cancelation_flat - step_size * velocity
             
-            current_residual = self._compute_residual(new_cancelation, target_error, subsequent_modules)
+            current_residual = self._compute_residual(new_cancelation, target_flat, subsequent_modules)
             
             if current_residual < best_residual:
                 best_residual = current_residual
-                best_cancelation = new_cancelation.clone()
-                cancelation = new_cancelation
+                best_cancelation_flat = new_cancelation.clone()
+                cancelation_flat = new_cancelation
             else:
                 current_lr *= 0.5
                 if current_lr < 1e-6:
                     break
-                cancelation = best_cancelation.clone()
+                cancelation_flat = best_cancelation_flat.clone()
                 velocity.zero_()
             
             if iteration > 5 and best_residual < self.convergence_tol:
                 break
         
-        batch_dims = output_shape[:-1]
-        final_cancelation = best_cancelation.expand(*batch_dims, -1).clone()
+        final_cancelation = best_cancelation_flat.view(*output_shape).clone()
         
         return final_cancelation.detach()
     

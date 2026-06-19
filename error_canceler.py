@@ -72,7 +72,8 @@ class ErrorCancellationInjector:
                             module_name: str,
                             output_low: torch.Tensor,
                             output_high: Optional[torch.Tensor] = None,
-                            force_full_solve: bool = False) -> torch.Tensor:
+                            force_full_solve: bool = False,
+                            timing_helper: Optional[object] = None) -> torch.Tensor:
         efm = self.tracker.get_tracker(module_name)
         if efm is None:
             return output_low
@@ -82,18 +83,25 @@ class ErrorCancellationInjector:
         estimated_error = None
         if output_high is not None:
             estimated_error = self._estimate_rounding_error(output_low, output_high, efm)
+            
+            if timing_helper is not None and hasattr(timing_helper, 'start_segment'):
+                timing_helper.start_segment('spectrum_analysis')
+            
             self.fourier_analyzer.analyze_error_spectrum(estimated_error, efm)
             efm.update_error_stats(estimated_error)
+            
+            if timing_helper is not None and hasattr(timing_helper, 'end_segment'):
+                timing_helper.end_segment('spectrum_analysis')
         
         subsequent = self._get_subsequent_modules(module_name)
-        
-        if len(subsequent) == 0:
-            return output_low
         
         for sub_efm, mtype in subsequent[:1]:
             self.fourier_analyzer.predict_amplification(efm, mtype)
         
         strength = self._compute_adaptive_strength(efm, subsequent)
+        
+        if timing_helper is not None and hasattr(timing_helper, 'start_segment'):
+            timing_helper.start_segment('inverse_solver')
         
         if self.use_fast_path and not force_full_solve:
             cancelation = self.inverse_solver.solve_spectral_domain(
@@ -104,8 +112,15 @@ class ErrorCancellationInjector:
             cancelation = self.inverse_solver.solve_cancelation_signal(
                 efm, subsequent,
                 observed_error=estimated_error,
-                output_shape=output_low.shape
+                output_shape=output_low.shape,
+                force_full_solve=force_full_solve
             )
+        
+        if timing_helper is not None and hasattr(timing_helper, 'end_segment'):
+            timing_helper.end_segment('inverse_solver')
+        
+        if timing_helper is not None and hasattr(timing_helper, 'start_segment'):
+            timing_helper.start_segment('noise_injection')
         
         output_scale = output_low.abs().mean().item() + 1e-8
         cancelation_scale = cancelation.abs().mean().item() + 1e-8
@@ -118,7 +133,12 @@ class ErrorCancellationInjector:
         if output_low.dtype in [torch.float16, torch.bfloat16]:
             final_cancelation = final_cancelation.to(output_low.dtype)
         
-        return output_low + final_cancelation
+        result = output_low + final_cancelation
+        
+        if timing_helper is not None and hasattr(timing_helper, 'end_segment'):
+            timing_helper.end_segment('noise_injection')
+        
+        return result
     
     def get_cancellation_stats(self) -> dict:
         stats = {}

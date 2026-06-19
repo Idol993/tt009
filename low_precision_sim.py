@@ -52,7 +52,11 @@ def quantize_to_fp8(x: torch.Tensor, mode: str = "e4m3") -> torch.Tensor:
 
 class LowPrecisionSimulator:
     def __init__(self, precision: str = "fp16"):
-        self.precision = precision.lower()
+        self.original_precision = precision.lower()
+        p = self.original_precision
+        if p == "fp8":
+            p = "fp8_e4m3"
+        self.precision = p
         self.mode = PrecisionMode(self.precision)
     
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
@@ -87,6 +91,8 @@ class LowPrecisionSimulator:
         return self.mode in [PrecisionMode.FP16, PrecisionMode.BF16]
     
     def precision_label(self) -> str:
+        if self.original_precision == "fp8":
+            return "FP8 (8位浮点，E4M3模拟量化)"
         labels = {
             PrecisionMode.FP32: "FP32 (单精度)",
             PrecisionMode.FP16: "FP16 (半精度)",

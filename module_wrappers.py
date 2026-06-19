@@ -109,22 +109,78 @@ class _TimingHelper:
         self._fwd_start: float = 0.0
         self._oh_accum: float = 0.0
         self._oh_start: float = 0.0
+        self._seg_start: float = 0.0
         self._is_active: bool = False
+        
+        self._segment_times = {
+            'reference_computation': 0.0,
+            'spectrum_analysis': 0.0,
+            'inverse_solver': 0.0,
+            'noise_injection': 0.0,
+        }
+        
+        self._total_segment_times = {k: 0.0 for k in self._segment_times.keys()}
+        self._total_forward_time: float = 0.0
+        self._forward_count: int = 0
     
     def start_forward(self):
         self._is_active = self.bc.start_forward()
         self._fwd_start = time.perf_counter()
         self._oh_accum = 0.0
+        for k in self._segment_times:
+            self._segment_times[k] = 0.0
     
     def start_overhead_segment(self):
         self._oh_start = time.perf_counter()
+    
+    def start_segment(self, segment_name: str):
+        if not self._is_active:
+            return
+        if segment_name not in self._segment_times:
+            return
+        self._seg_start = time.perf_counter()
+    
+    def end_segment(self, segment_name: str):
+        if not self._is_active:
+            return
+        if segment_name not in self._segment_times:
+            return
+        dt = time.perf_counter() - self._seg_start
+        self._segment_times[segment_name] += dt
+        self._oh_accum += dt
     
     def end_overhead_segment(self):
         self._oh_accum += time.perf_counter() - self._oh_start
     
     def end_forward(self):
         total_fwd = time.perf_counter() - self._fwd_start
+        self._forward_count += 1
+        self._total_forward_time += total_fwd
+        
+        if self._is_active:
+            for k, v in self._segment_times.items():
+                self._total_segment_times[k] += v
+        
         self.bc.end_forward(total_fwd, self._oh_accum)
+    
+    def get_segment_stats(self) -> dict:
+        total = self._total_forward_time
+        if total <= 0:
+            return {k: {'time_ms': 0.0, 'pct': 0.0} for k in self._total_segment_times}
+        
+        return {
+            k: {
+                'time_ms': v * 1000.0,
+                'pct': (v / total) * 100.0
+            }
+            for k, v in self._total_segment_times.items()
+        }
+    
+    def reset(self):
+        for k in self._total_segment_times:
+            self._total_segment_times[k] = 0.0
+        self._total_forward_time = 0.0
+        self._forward_count = 0
 
 
 class ErrorCompensatedLinear(nn.Module):
@@ -159,11 +215,6 @@ class ErrorCompensatedLinear(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        if not self.budget_controller.should_run_cancellation():
-            return self.linear(x)
-        
-        self.timing_helper.start_overhead_segment()
-        
         use_native = self.precision_sim.is_native_low_precision()
         
         if use_native:
@@ -177,6 +228,22 @@ class ErrorCompensatedLinear(nn.Module):
                                      self.linear.bias.float() if self.linear.bias is not None else None)
             output_low = self.precision_sim.quantize(output_fp32)
         
+        if not self.budget_controller.should_run_cancellation():
+            with torch.no_grad():
+                output_high = F.linear(
+                    x.float(),
+                    self.linear.weight.float(),
+                    self.linear.bias.float() if self.linear.bias is not None else None
+                )
+                observed_error = output_low - output_high
+                efm = self.tracker.get_tracker(self.name)
+                if efm is not None:
+                    efm.update_error_stats(observed_error)
+            return output_low
+        
+        self.timing_helper.start_overhead_segment()
+        self.timing_helper.start_segment('reference_computation')
+        
         with torch.no_grad():
             output_high = F.linear(
                 x.float(),
@@ -185,8 +252,11 @@ class ErrorCompensatedLinear(nn.Module):
             )
             observed_error = output_low - output_high
         
+        self.timing_helper.end_segment('reference_computation')
+        
         output_compensated = self.canceler.compute_and_inject(
-            self.name, output_low, output_high
+            self.name, output_low, output_high,
+            timing_helper=self.timing_helper
         )
         
         self.timing_helper.end_overhead_segment()
@@ -224,11 +294,6 @@ class ErrorCompensatedLayerNorm(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        if not self.budget_controller.should_run_cancellation():
-            return self.norm(x)
-        
-        self.timing_helper.start_overhead_segment()
-        
         use_native = self.precision_sim.is_native_low_precision()
         
         if use_native:
@@ -248,6 +313,23 @@ class ErrorCompensatedLayerNorm(nn.Module):
             )
             output_low = self.precision_sim.quantize(output_fp32)
         
+        if not self.budget_controller.should_run_cancellation():
+            with torch.no_grad():
+                output_high = F.layer_norm(
+                    x.float(), self.norm.normalized_shape,
+                    self.norm.weight.float() if self.norm.weight is not None else None,
+                    self.norm.bias.float() if self.norm.bias is not None else None,
+                    self.norm.eps
+                )
+                observed_error = output_low - output_high
+                efm = self.tracker.get_tracker(self.name)
+                if efm is not None:
+                    efm.update_error_stats(observed_error)
+            return output_low
+        
+        self.timing_helper.start_overhead_segment()
+        self.timing_helper.start_segment('reference_computation')
+        
         with torch.no_grad():
             output_high = F.layer_norm(
                 x.float(), self.norm.normalized_shape,
@@ -256,8 +338,11 @@ class ErrorCompensatedLayerNorm(nn.Module):
                 self.norm.eps
             )
         
+        self.timing_helper.end_segment('reference_computation')
+        
         output_compensated = self.canceler.compute_and_inject(
-            self.name, output_low, output_high
+            self.name, output_low, output_high,
+            timing_helper=self.timing_helper
         )
         
         self.timing_helper.end_overhead_segment()
@@ -295,11 +380,6 @@ class ErrorCompensatedGELU(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        if not self.budget_controller.should_run_cancellation():
-            return F.gelu(x, approximate=self.approximate)
-        
-        self.timing_helper.start_overhead_segment()
-        
         use_native = self.precision_sim.is_native_low_precision()
         
         if use_native:
@@ -309,11 +389,26 @@ class ErrorCompensatedGELU(nn.Module):
             output_fp32 = F.gelu(x.float(), approximate='none')
             output_low = self.precision_sim.quantize(output_fp32)
         
+        if not self.budget_controller.should_run_cancellation():
+            with torch.no_grad():
+                output_high = F.gelu(x.float(), approximate='none')
+                observed_error = output_low - output_high
+                efm = self.tracker.get_tracker(self.name)
+                if efm is not None:
+                    efm.update_error_stats(observed_error)
+            return output_low
+        
+        self.timing_helper.start_overhead_segment()
+        self.timing_helper.start_segment('reference_computation')
+        
         with torch.no_grad():
             output_high = F.gelu(x.float(), approximate='none')
         
+        self.timing_helper.end_segment('reference_computation')
+        
         output_compensated = self.canceler.compute_and_inject(
-            self.name, output_low, output_high
+            self.name, output_low, output_high,
+            timing_helper=self.timing_helper
         )
         
         self.timing_helper.end_overhead_segment()
@@ -351,11 +446,6 @@ class ErrorCompensatedSoftmax(nn.Module):
         if not self._is_registered:
             self._register(x.shape)
         
-        if not self.budget_controller.should_run_cancellation():
-            return F.softmax(x, dim=self.dim)
-        
-        self.timing_helper.start_overhead_segment()
-        
         use_native = self.precision_sim.is_native_low_precision()
         
         if use_native:
@@ -365,11 +455,26 @@ class ErrorCompensatedSoftmax(nn.Module):
             output_fp32 = F.softmax(x.float(), dim=self.dim)
             output_low = self.precision_sim.quantize(output_fp32)
         
+        if not self.budget_controller.should_run_cancellation():
+            with torch.no_grad():
+                output_high = F.softmax(x.float(), dim=self.dim)
+                observed_error = output_low - output_high
+                efm = self.tracker.get_tracker(self.name)
+                if efm is not None:
+                    efm.update_error_stats(observed_error)
+            return output_low
+        
+        self.timing_helper.start_overhead_segment()
+        self.timing_helper.start_segment('reference_computation')
+        
         with torch.no_grad():
             output_high = F.softmax(x.float(), dim=self.dim)
         
+        self.timing_helper.end_segment('reference_computation')
+        
         output_compensated = self.canceler.compute_and_inject(
-            self.name, output_low, output_high
+            self.name, output_low, output_high,
+            timing_helper=self.timing_helper
         )
         
         self.timing_helper.end_overhead_segment()

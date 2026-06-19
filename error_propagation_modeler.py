@@ -22,8 +22,12 @@ class ErrorPropagationModeler:
                  max_cancellation_strength: float = 0.3,
                  solver_max_iter: int = 30,
                  use_fast_path: bool = True):
-        self.precision = precision.lower()
-        self.precision_sim = LowPrecisionSimulator(precision)
+        self.original_precision = precision.lower()
+        p = self.original_precision
+        if p == "fp8":
+            p = "fp8_e4m3"
+        self.precision = p
+        self.precision_sim = LowPrecisionSimulator(self.original_precision)
         
         self.tracker = ModuleErrorTracker()
         self.fourier_analyzer = FourierModeAnalyzer(n_modes=n_fourier_modes)
@@ -75,12 +79,19 @@ class ErrorPropagationModeler:
         return self.budget_controller.get_current_overhead_ratio()
     
     def get_cancellation_stats(self) -> Dict[str, Any]:
+        segment_stats = self.timing_helper.get_segment_stats()
+        total_segment_ms = sum(v['time_ms'] for v in segment_stats.values())
+        
         return {
             "precision": self.precision,
             "precision_label": self.precision_sim.precision_label(),
             "overhead_ratio": self.get_overhead_ratio(),
             "module_stats": self.canceler.get_cancellation_stats(),
             "registered_modules": len(self.tracker.trackers),
+            "segment_stats": segment_stats,
+            "total_overhead_ms": total_segment_ms,
+            "total_forward_ms": self.timing_helper._total_forward_time * 1000.0,
+            "forward_count": self.timing_helper._forward_count,
         }
     
     def print_stats(self):
