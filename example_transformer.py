@@ -104,7 +104,7 @@ def verify_cancellation_identity():
     )
     efm.initialize_tensors(device)
     
-    def verify_scenario(name, test_error, subsequent_modules, require_exact_improvement=False):
+    def verify_scenario(name, test_error, subsequent_modules, require_better_than_fast=False):
         error_fft = torch.fft.rfft(test_error.mean(dim=0), n=dim)
         efm.error_spectrum = error_fft.abs().pow(2).detach()
         efm.error_mean = test_error.mean(dim=0).detach()
@@ -122,57 +122,69 @@ def verify_cancellation_identity():
         cancelation_full = solver.solve_cancelation_signal(
             efm, subsequent_modules,
             observed_error=test_error,
-            output_shape=test_error.shape
+            output_shape=test_error.shape,
+            force_full_solve=True
         )
         result_full = solver.verify_cancellation(test_error, cancelation_full, subsequent_modules)
         
         fast_diff = (cancelation_fast - cancelation_full).abs().max().item()
-        fast_equals_full = fast_diff < 1e-8
+        fast_equals_full = fast_diff < 1e-6
         
-        fast_better = result_fast['combined_norm'] < result_none['combined_norm'] * 0.99
-        full_better_than_none = result_full['combined_norm'] < result_none['combined_norm'] * 0.99
+        none_norm = result_none['error_norm']
+        fast_norm = result_fast['combined_norm']
+        full_norm = result_full['combined_norm']
         
-        is_linear = not require_exact_improvement
+        fast_reduction = (none_norm - fast_norm) / none_norm * 100
+        full_reduction = (none_norm - full_norm) / none_norm * 100
+        
+        full_vs_fast = (fast_norm - full_norm) / fast_norm * 100
         
         print(f"\n--- {name} ---")
-        print(f"  {'不开抵消':<15}: 残差范数={result_none['error_norm']:.6e}")
-        print(f"  {'快速路径':<15}: 残差范数={result_fast['combined_norm']:.6e}, "
-              f"降低={result_fast['reduction_ratio']*100:6.2f}%, "
+        print(f"  {'不开抵消':<15}: 残差={none_norm:.6e}  (基线)")
+        print(f"  {'快速路径':<15}: 残差={fast_norm:.6e}  ↓{fast_reduction:5.2f}%  "
               f"相位cos={result_fast['cos_similarity']:.4f}")
-        print(f"  {'精确路径':<15}: 残差范数={result_full['combined_norm']:.6e}, "
-              f"降低={result_full['reduction_ratio']*100:6.2f}%, "
+        print(f"  {'精确路径':<15}: 残差={full_norm:.6e}  ↓{full_reduction:5.2f}%  "
               f"相位cos={result_full['cos_similarity']:.4f}")
         
-        if is_linear and fast_equals_full:
-            print(f"  [信息] 线性场景精确路径复用快速路径最优解（已达理论最优）")
-            full_pass = True
-        elif fast_equals_full:
-            print(f"  [失败] 精确路径复用了快速路径结果，未做实际迭代优化")
-            full_pass = False
+        if full_vs_fast > 0:
+            print(f"                   {'精确比快':>10}: ↓{full_vs_fast:.2f}%")
+        elif full_vs_fast < 0:
+            print(f"                   {'精确比快':>10}: ↑{-full_vs_fast:.2f}% (更差)")
         else:
-            full_pass = True
-            if require_exact_improvement:
-                print(f"  [信息] 非线性场景精确路径完成迭代优化（与快速路径差异={fast_diff:.2e}）")
+            print(f"                   {'精确比快':>10}: 持平")
         
         all_pass = True
-        if not fast_better:
-            print(f"  [失败] 快速路径残差未明显降低")
-            all_pass = False
-        if not full_better_than_none:
-            print(f"  [失败] 精确路径残差未明显降低")
-            all_pass = False
-        if result_fast['cos_similarity'] >= -0.1:
-            print(f"  [失败] 快速路径未反相（cos >= -0.1）")
-            all_pass = False
-        if result_full['cos_similarity'] >= -0.1:
-            print(f"  [失败] 精确路径未反相（cos >= -0.1）")
+        reasons = []
+        
+        if fast_norm >= none_norm * 0.99:
+            reasons.append("快速路径残差未明显降低")
             all_pass = False
         
-        if all_pass and full_pass:
+        if full_norm >= none_norm * 0.99:
+            reasons.append("精确路径残差未明显降低")
+            all_pass = False
+        
+        if fast_equals_full:
+            reasons.append("精确路径复用快速路径结果，未做实际迭代")
+            all_pass = False
+        
+        if require_better_than_fast and full_norm >= fast_norm:
+            reasons.append("精确路径残差未低于快速路径")
+            all_pass = False
+        
+        if result_fast['cos_similarity'] >= -0.1:
+            reasons.append("快速路径未反相")
+            all_pass = False
+        
+        if result_full['cos_similarity'] >= -0.1:
+            reasons.append("精确路径未反相")
+            all_pass = False
+        
+        if all_pass:
             print(f"  [通过] 三组对比验证全部通过")
         else:
-            print(f"  [失败] 验证未通过")
-            all_pass = False
+            for r in reasons:
+                print(f"  [失败] {r}")
         
         return all_pass
     
@@ -187,19 +199,19 @@ def verify_cancellation_identity():
     all_results.append(verify_scenario(
         "恒等传播 (0层后续模块)",
         test_error_bias, [],
-        require_exact_improvement=False
+        require_better_than_fast=False
     ))
     
     all_results.append(verify_scenario(
         "单层Linear传播 (1层后续模块)",
         test_error_bias, [(efm, ModuleType.LINEAR)],
-        require_exact_improvement=False
+        require_better_than_fast=False
     ))
     
     all_results.append(verify_scenario(
         "单层GELU传播 (非线性模块)",
         test_error_bias, [(efm, ModuleType.GELU)],
-        require_exact_improvement=True
+        require_better_than_fast=True
     ))
     
     print("\n" + "=" * 60)

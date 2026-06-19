@@ -76,7 +76,7 @@ class ErrorPropagationModeler:
             self.timing_helper.end_forward()
     
     def get_overhead_ratio(self) -> float:
-        return self.budget_controller.get_current_overhead_ratio()
+        return self.timing_helper.get_real_overhead_ratio()
     
     def get_cancellation_stats(self) -> Dict[str, Any]:
         segment_stats = self.timing_helper.get_segment_stats()

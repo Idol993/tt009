@@ -163,17 +163,21 @@ class InverseErrorPropagationSolver:
             for _, mt in subsequent_modules
         )
         
-        cancelation = self.solve_spectral_domain(
+        cancelation_fast = self.solve_spectral_domain(
             current_efm, subsequent_modules,
             output_shape=output_shape,
             observed_error=target_error
         )
         
         if not has_nonlinear and not force_full_solve:
-            return cancelation.detach()
+            return cancelation_fast.detach()
         
         target_flat = target_error.detach().view(-1, target_error.size(-1))
-        cancelation_flat = cancelation.detach().view(-1, cancelation.size(-1))
+        
+        if force_full_solve:
+            cancelation_flat = torch.zeros_like(target_flat)
+        else:
+            cancelation_flat = cancelation_fast.detach().view(-1, cancelation_fast.size(-1))
         
         best_residual = self._compute_residual(cancelation_flat, target_flat, subsequent_modules)
         best_cancelation_flat = cancelation_flat.clone()
@@ -181,7 +185,9 @@ class InverseErrorPropagationSolver:
         velocity = torch.zeros_like(cancelation_flat)
         current_lr = self.lr
         
-        for iteration in range(self.max_iter):
+        effective_iter = self.max_iter * 3 if force_full_solve else self.max_iter
+        
+        for iteration in range(effective_iter):
             propagated = self.forward_propagate(cancelation_flat, subsequent_modules)
             residual = propagated + target_flat
             
@@ -189,11 +195,11 @@ class InverseErrorPropagationSolver:
             grad = self._back_propagate_gradient(grad, subsequent_modules, cancelation_flat)
             
             grad_norm = grad.norm()
-            if grad_norm < self.regularization:
+            if grad_norm < self.regularization * 0.1:
                 break
             
             velocity = self.damping * velocity + (1.0 - self.damping) * grad
-            step_size = current_lr / (1.0 + iteration * 0.01)
+            step_size = current_lr / (1.0 + iteration * 0.005)
             
             new_cancelation = cancelation_flat - step_size * velocity
             
@@ -205,12 +211,12 @@ class InverseErrorPropagationSolver:
                 cancelation_flat = new_cancelation
             else:
                 current_lr *= 0.5
-                if current_lr < 1e-6:
+                if current_lr < 1e-7:
                     break
                 cancelation_flat = best_cancelation_flat.clone()
                 velocity.zero_()
             
-            if iteration > 5 and best_residual < self.convergence_tol:
+            if iteration > 10 and best_residual < self.convergence_tol * 0.1:
                 break
         
         final_cancelation = best_cancelation_flat.view(*output_shape).clone()

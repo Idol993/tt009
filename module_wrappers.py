@@ -81,7 +81,8 @@ class BudgetController:
                 elif self._current_skip > target_skip * 3:
                     self._current_skip = max(1, self._current_skip - 2)
                 
-                self._skip_counter = self._current_skip
+                if self._is_current_forward_active:
+                    self._skip_counter = self._current_skip
     
     def should_run_cancellation(self) -> bool:
         return self._is_current_forward_active and self._enabled
@@ -176,6 +177,13 @@ class _TimingHelper:
             for k, v in self._total_segment_times.items()
         }
     
+    def get_real_overhead_ratio(self) -> float:
+        total = self._total_forward_time
+        if total <= 0:
+            return 0.0
+        total_seg = sum(self._total_segment_times.values())
+        return total_seg / total
+    
     def reset(self):
         for k in self._total_segment_times:
             self._total_segment_times[k] = 0.0
@@ -229,16 +237,6 @@ class ErrorCompensatedLinear(nn.Module):
             output_low = self.precision_sim.quantize(output_fp32)
         
         if not self.budget_controller.should_run_cancellation():
-            with torch.no_grad():
-                output_high = F.linear(
-                    x.float(),
-                    self.linear.weight.float(),
-                    self.linear.bias.float() if self.linear.bias is not None else None
-                )
-                observed_error = output_low - output_high
-                efm = self.tracker.get_tracker(self.name)
-                if efm is not None:
-                    efm.update_error_stats(observed_error)
             return output_low
         
         self.timing_helper.start_overhead_segment()
@@ -314,17 +312,6 @@ class ErrorCompensatedLayerNorm(nn.Module):
             output_low = self.precision_sim.quantize(output_fp32)
         
         if not self.budget_controller.should_run_cancellation():
-            with torch.no_grad():
-                output_high = F.layer_norm(
-                    x.float(), self.norm.normalized_shape,
-                    self.norm.weight.float() if self.norm.weight is not None else None,
-                    self.norm.bias.float() if self.norm.bias is not None else None,
-                    self.norm.eps
-                )
-                observed_error = output_low - output_high
-                efm = self.tracker.get_tracker(self.name)
-                if efm is not None:
-                    efm.update_error_stats(observed_error)
             return output_low
         
         self.timing_helper.start_overhead_segment()
@@ -390,12 +377,6 @@ class ErrorCompensatedGELU(nn.Module):
             output_low = self.precision_sim.quantize(output_fp32)
         
         if not self.budget_controller.should_run_cancellation():
-            with torch.no_grad():
-                output_high = F.gelu(x.float(), approximate='none')
-                observed_error = output_low - output_high
-                efm = self.tracker.get_tracker(self.name)
-                if efm is not None:
-                    efm.update_error_stats(observed_error)
             return output_low
         
         self.timing_helper.start_overhead_segment()
@@ -456,12 +437,6 @@ class ErrorCompensatedSoftmax(nn.Module):
             output_low = self.precision_sim.quantize(output_fp32)
         
         if not self.budget_controller.should_run_cancellation():
-            with torch.no_grad():
-                output_high = F.softmax(x.float(), dim=self.dim)
-                observed_error = output_low - output_high
-                efm = self.tracker.get_tracker(self.name)
-                if efm is not None:
-                    efm.update_error_stats(observed_error)
             return output_low
         
         self.timing_helper.start_overhead_segment()
